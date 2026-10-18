@@ -1,0 +1,206 @@
+#include <roller/semantic_segmentation/semantic_segmentation.hpp>
+#include <utility>
+
+using namespace roller;
+
+semantic_segmentation::semantic_segmentation(rclcpp::Node *_node, std::mutex *_db_mutex){
+    m_pointcloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    m_searchtree = pcl::make_shared<pcl::search::KdTree<pcl::PointXYZ>>();
+    labeled_cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZL>>();
+
+    bandwidth = _node->get_parameter("segmentation.bandwidth").as_double();
+    cluster_threshold = bandwidth / 2 ;
+    epsilon = _node->get_parameter("segmentation.epsilon").as_double();
+    voxel_size = _node->get_parameter("voxel_size").as_double();
+    sonar_range = _node->get_parameter("sonar.range").as_double();
+    truncation = _node->get_parameter("tsdf.sdf_trunc").as_double();
+    max_iter = _node->get_parameter("segmentation.max_nb_of_iterations").as_int();
+    leaf_size = _node->get_parameter("segmentation.leaf_size").as_double();
+}
+
+
+nanovdb::math::Ray<float> semantic_segmentation::getRay(const Eigen::Vector3i &sensor_pos, const Eigen::Vector3f &vector_to_sensor, float range_around_point){
+    float search_window = range_around_point/voxel_size;
+    float distance_point_sensor = vector_to_sensor.norm();
+    return nanovdb::math::Ray<float>(
+        nanovdb::Vec3f(sensor_pos.x(), sensor_pos.y(), sensor_pos.z()), 
+        nanovdb::Vec3f(vector_to_sensor.x(), vector_to_sensor.y(), vector_to_sensor.z()), 
+        distance_point_sensor-search_window, std::max<float>(sonar_range/voxel_size,distance_point_sensor+search_window)
+    );
+}
+
+
+
+
+
+void semantic_segmentation::generate_pointcloud(std::vector<Submap> map, const TsdfData &tsdf, bool NoProcessJustSave){
+    nanovdb::FloatGrid::AccessorType sdf_accessor = tsdf.sdf->grid<float>()->getAccessor();
+    pcl::PointXYZ current_pt;
+    for (const auto &submap : map) {
+        for (int index = 0; index < submap.keyframe_pointclouds.size(); index++) {
+            PointCloudInt keyframe;
+            pcl::transformPointCloud(submap.keyframe_pointclouds[index], keyframe, submap.correction);
+            const auto &pose = submap.correction * submap.keyframe_poses[index].fg;
+            Eigen::Vector3f sensor_pos = pose.block<3, 1>(0, 3); // get sensor position in Eigen format
+            Eigen::Vector3i sensor_pos_index = (sensor_pos / voxel_size).cast<int>();
+            for (const auto &pt : keyframe.points) {
+                if(NoProcessJustSave){
+                    current_pt.x = pt.x;
+                    current_pt.y = pt.y;
+                    current_pt.z = pt.z;
+                    m_pointcloud->push_back(current_pt);
+                }
+                else{
+                   //openvdb::Vec3f sensor_pos(sensor_pos_eigen.x(), sensor_pos_eigen.y(), sensor_pos_eigen.z()); // get sensor position
+                    Eigen::Vector3i pt_index = (pt.getVector3fMap() / voxel_size).cast<int>();
+                    Eigen::Vector3i point_to_sensor = sensor_pos_index - pt_index;
+                    if(point_to_sensor.norm()==0){continue;}
+                    Eigen::Vector3f dir_point_to_sensor = point_to_sensor.cast<float>().normalized();
+
+
+                    nanovdb::Coord point_on_tsdf;
+                    float d_PointToTsdf;
+                    float crossingPointValue;
+                    nanovdb::math::Ray<float> ray = getRay(sensor_pos_index, -dir_point_to_sensor, truncation);
+                    if(nanovdb::math::ZeroCrossing(ray, sdf_accessor, point_on_tsdf, crossingPointValue, d_PointToTsdf)){
+                        current_pt.x = pt.x;
+                        current_pt.y = pt.y;
+                        current_pt.z = pt.z;
+                        m_pointcloud->push_back(current_pt);
+                        current_pt.getVector3fMap().setZero();
+                    } 
+                }
+                
+            }
+        }
+    }
+}
+
+void semantic_segmentation::voxelize_pointcloud(){
+    pcl::VoxelGrid<pcl::PointXYZ> sor;
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_filtered = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+
+
+    sor.setInputCloud(m_pointcloud);
+    sor.setLeafSize(leaf_size, leaf_size, leaf_size);
+    sor.filter (*cloud_filtered);
+
+    m_pointcloud = cloud_filtered;
+}
+void semantic_segmentation::mean_shift() {
+    final_modes.resize(m_pointcloud->size());
+    m_searchtree->setInputCloud(m_pointcloud);
+
+    #pragma omp parallel for
+    for (int i = 0; i < static_cast<int>(m_pointcloud->size()); ++i) {
+        Eigen::Vector3f current_mode = m_pointcloud->points[i].getVector3fMap();
+        bool converged = false;
+        int iter = 0;
+        
+        std::vector<int> indices;
+        std::vector<float> dists_sq;
+
+        while (!converged && iter < max_iter) {
+            indices.clear();
+            dists_sq.clear();
+
+
+            if (m_searchtree->radiusSearch(pcl::PointXYZ(current_mode.x(), current_mode.y(), current_mode.z()), 
+                                          bandwidth, indices, dists_sq) > 0) 
+            {
+                Eigen::Vector3f shift_accum(0, 0, 0);
+                double total_weight = 0;
+
+                for (size_t j = 0; j < indices.size(); ++j) {
+
+                    double weight = std::exp(-dists_sq[j] / (2.0 * bandwidth * bandwidth));
+                    shift_accum += m_pointcloud->points[indices[j]].getVector3fMap() * static_cast<float>(weight);
+                    total_weight += weight;
+                }
+
+                if (total_weight > 0) {
+                    Eigen::Vector3f new_mode = shift_accum / static_cast<float>(total_weight);
+
+                    if ((current_mode - new_mode).norm() < epsilon) {
+                        converged = true;
+                    }
+                    current_mode = new_mode;
+                } else {
+                    converged = true; 
+                }
+            } else {
+                converged = true;
+            }
+            iter++;
+        }
+        
+        final_modes[i].x = current_mode.x();
+        final_modes[i].y = current_mode.y();
+        final_modes[i].z = current_mode.z();
+    }
+}
+
+void semantic_segmentation::attribute_labels(){
+    for (size_t i = 0; i < m_pointcloud->size(); ++i) {
+        int label = -1;
+        for (size_t j = 0; j < unique_modes.size(); ++j) {
+            if (pcl::euclideanDistance(final_modes[i], unique_modes[j]) < cluster_threshold) {
+                label = j;
+                break;
+            }
+        }
+        if (label == -1) {
+            unique_modes.push_back(final_modes[i]);
+            label = unique_modes.size() - 1;
+        }
+
+        pcl::PointXYZL p;
+        p.x = m_pointcloud->points[i].x; p.y = m_pointcloud->points[i].y; p.z = m_pointcloud->points[i].z;
+        p.label = label; 
+        labeled_cloud->push_back(p);
+    }
+}
+
+void semantic_segmentation::clear(){
+    m_searchtree.reset();
+    labeled_cloud.reset();
+    m_pointcloud.reset();
+    final_modes.clear();
+    unique_modes.clear();
+}
+
+void semantic_segmentation::save(const std::string &directory, std::string filename, bool NoProcessJustSave){
+    if(NoProcessJustSave){
+        pcl::io::savePCDFileBinary(directory + filename, *m_pointcloud);
+    }else{
+        std::string meanshift_results = directory + "meanShift/";
+        pcl::io::savePCDFileBinary(meanshift_results + filename, *labeled_cloud);
+    }
+    std::cout << "PointCloud " << filename << " sauvegardé dans : " << directory << std::endl;    
+}
+
+
+
+void semantic_segmentation::start(std::vector<Submap> map, const TsdfData &tsdf, const std::string &directory, bool NoProcessJustSave){
+    generate_pointcloud(map, tsdf, false);
+    std::cout << "Pointcloud créé, possède " << m_pointcloud->size() << " points"<<std::endl;
+
+    if(NoProcessJustSave){
+        save(directory, "original_pointcloud.pcd", NoProcessJustSave);
+    }
+
+    voxelize_pointcloud();
+    std::cout << "Pointcloud voxelisé, possède maintenant " << m_pointcloud->size() << " points"<<std::endl;
+
+    if(NoProcessJustSave){
+        save(directory, "voxelized_pointcloud.pcd", NoProcessJustSave);
+    }else{
+        mean_shift();
+        std::cout << "Segmentation via mean shift terminée." << std::endl;
+        attribute_labels();
+        std::cout << "Clusters labélisés. " << unique_modes.size() << " clusters trouvés." << std::endl;
+        save(directory, "meanshift_cloud.pcd", NoProcessJustSave);
+        clear();
+        std::cout << "Segmentation cleared" << std::endl;
+    }
+}

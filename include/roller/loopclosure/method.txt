@@ -1,0 +1,10 @@
+3D point cloud semantic segmentation (PCSS) method :
+
+
+Point cloud segmentation (PCS) method :
+    - Region Growing
+    - Model Fitting :
+        - Kernel-Based HT (KHT)
+        - RANSAC 
+    - Clusterring :
+        - Mean Shift

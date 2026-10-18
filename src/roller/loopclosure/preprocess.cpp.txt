@@ -1,0 +1,255 @@
+#include <roller/loopclosure/preprocess.hpp>
+#include <utility>
+
+#define MIN_NEIGHBOR 26
+#define MAX_ROTATION_DIF 45.0f
+#define MAX_TRANSLATION_DIF 15.0f
+
+using namespace roller::loopclosure;
+
+PreProcess::PreProcess(rclcpp::Node *_node, std::mutex *_db_mutex) : m_node(_node),
+                                                                     m_db_mutex(_db_mutex),
+                                                                     m_voxel_size(_node->get_parameter("voxel_size").as_double()),
+                                                                     m_sonar_range(_node->get_parameter("sonar.range").as_double()),
+                                                                     m_MaxDistance_From_Tsdf(_node->get_parameter("tsdf.sdf_trunc").as_double())
+{
+    
+}
+
+PreProcess::~PreProcess() = default;
+
+void PreProcess::set_reference(PointCloudInt ref, Matrix4 correction, Matrix4 fg, const TsdfData &tsdf)
+{
+    is_reference_set = true;
+    reference_pose = correction * fg;
+    Eigen::Vector3f reference_sensor_xyz = reference_pose.block<3, 1>(0, 3);
+    PointCloudInt ref_keyframe;
+    pcl::transformPointCloud(ref, ref_keyframe, correction);
+
+    process_keyframe(ref_keyframe, reference_sensor_xyz, tsdf, true);
+}
+
+void PreProcess::new_input(PointCloudInt input, Matrix4 correction, Matrix4 fg, const TsdfData &tsdf)
+{
+    if (!is_reference_set)
+    {
+        RCLCPP_INFO(m_node->get_logger(), "[ERROR] : Reference not set, input not taken into account");
+        return;
+    }
+    Eigen::Matrix4f pose = correction * fg;
+    Eigen::Vector3f sensor_xyz = pose.block<3, 1>(0, 3);
+    TransformationError Sensor_displacement = Utils::transformation_matrix_eval(reference_pose, pose); 
+    if (Sensor_displacement.translation_error > MAX_TRANSLATION_DIF || Sensor_displacement.rotation_error > MAX_ROTATION_DIF)
+    {
+        RCLCPP_INFO(m_node->get_logger(), "[ERROR] : Sensor too far away from reference, input geometrically eliminated");
+        return;
+    }
+    PointCloudInt input_keyframe;
+
+    pcl::transformPointCloud(input, input_keyframe, correction);
+
+    process_keyframe(input_keyframe, sensor_xyz, tsdf, false);
+}
+
+// Eigen::Vector3f sensor_pos
+void PreProcess::process_keyframe(PointCloudInt keyframe, Eigen::Vector3f sensor_pos, const TsdfData &tsdf, bool is_ref)
+{
+    clear();
+    bool debug = false;
+    std::atomic<int> dbg_eliminated_points{0};
+
+    nanovdb::FloatGrid *nano_tsdf = tsdf.sdf->grid<float>();
+
+    auto start = std::chrono::high_resolution_clock::now();
+    openvdb::FloatGrid::Ptr sdfgrid_flooded = nano_signedFloodFillWithValues(nano_tsdf);
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end - start;
+    tsdf_filter_timer = duration.count();
+
+
+    
+
+    // get sensor position
+    openvdb::Vec3f sensor_pos_index(static_cast<int>(sensor_pos.x() / m_voxel_size),
+                                    static_cast<int>(sensor_pos.y() / m_voxel_size),
+                                    static_cast<int>(sensor_pos.z() / m_voxel_size));
+
+
+    openvdb::tools::LevelSetRayIntersector<openvdb::FloatGrid> intersector(*sdfgrid_flooded);
+
+    //for (const auto &pt : keyframe.points)
+    std::for_each(std::execution::par_unseq , keyframe.begin(), keyframe.end(), [&](pcl::PointXYZI& pt){
+        // Local accesor to avoid race conditions
+        auto local_sdf_accessor = sdfgrid_flooded->getAccessor();
+        auto ref_normal_accessor = ref_normal_grid->getAccessor();
+        auto ref_weight_accessor = input_weight_grid->getAccessor();
+        auto input_normal_accessor = input_normal_grid->getAccessor();
+        auto input_weight_accessor = input_weight_grid->getAccessor();
+
+        openvdb::Vec3f point_index(static_cast<int>(pt.x / m_voxel_size),
+                                   static_cast<int>(pt.y / m_voxel_size),
+                                   static_cast<int>(pt.z / m_voxel_size));
+
+        openvdb::Vec3f vector_to_sensor = sensor_pos_index - point_index;
+        openvdb::Vec3f dir_to_sensor = vector_to_sensor.unit();
+        float dist_voxels = vector_to_sensor.length();
+        if (dist_voxels == 0){ dbg_eliminated_points++; return;}
+
+
+        openvdb::Vec3d point_on_tsdf_double;
+        double d_PointToTsdf;
+        openvdb::math::Ray<double> ray = getRay(sensor_pos_index, -dir_to_sensor, m_MaxDistance_From_Tsdf);
+        
+        if (intersector.intersectsIS(ray, point_on_tsdf_double, d_PointToTsdf)) 
+        {
+            openvdb::Vec3s point_on_tsdf = openvdb::Vec3s(point_on_tsdf_double);
+
+            openvdb::Coord ovdb_point_on_tsdf(point_on_tsdf.x(), point_on_tsdf.y(), point_on_tsdf.z());
+
+            openvdb::Vec3s normal = compute_normal(local_sdf_accessor, ovdb_point_on_tsdf, debug);
+
+            if (normal.length() == 0){ dbg_eliminated_points ++; return;}
+
+            if (is_ref)
+            {
+                ref_normal_accessor.setValue(ovdb_point_on_tsdf, normal);
+                ref_weight_accessor.setValue(ovdb_point_on_tsdf, d_PointToTsdf);
+            }
+            else
+            {
+                input_normal_accessor.setValue(ovdb_point_on_tsdf, normal);
+                input_weight_accessor.setValue(ovdb_point_on_tsdf, d_PointToTsdf);
+            }
+        }
+        else
+        {
+            dbg_eliminated_points++;
+            if (dbg_eliminated_points < 5)
+            {
+
+                std::cout << "Sensor pos = " << sensor_pos_index.x() << ", " << sensor_pos_index.y() << ", " << sensor_pos_index.z() << std::endl;
+                std::cout << "Point = " << point_index.x() << ", " << point_index.y() << ", " << point_index.z() << std::endl;
+                std::cout << "Ray start = " << ray.start()[0] << ", " << ray.start()[1] << ", " << ray.start()[2] << std::endl;
+                std::cout << "Sensor to point = " << vector_to_sensor.length() << std::endl;
+                std::cout << "ZERO CROSSING OUTPUT :" << std::endl;
+                std::cout << "     -> Voxel found by ZC = " << point_on_tsdf_double.x() << ", " << point_on_tsdf_double.y() << ", " << point_on_tsdf_double.z() << std::endl;
+                std::cout << "     -> Sensor to tsdf (sortie ZC) = " << d_PointToTsdf << std::endl;
+            }
+        }
+    });
+}
+
+openvdb::math::Ray<double> PreProcess::getRay(const openvdb::Vec3f &ray_start, const openvdb::Vec3f &ray_direction, float range_around_point)
+{
+    float search_window = range_around_point / m_voxel_size;
+    float distance_point_sensor = ray_direction.length();
+    return openvdb::math::Ray<double>(
+        openvdb::Vec3f(ray_start.x(), ray_start.y(), ray_start.z()),
+        openvdb::Vec3f(ray_direction.x(), ray_direction.y(), ray_direction.z()),
+        std::max(0.0f, distance_point_sensor - search_window),                                                      //lower limit
+        std::min(m_sonar_range / m_voxel_size, distance_point_sensor + search_window)                               //upper limit
+    );
+}
+
+
+openvdb::FloatGrid::Ptr PreProcess::nano_signedFloodFillWithValues(nanovdb::FloatGrid *nanoGrid)
+{
+    buffer_sdf_grid = nanovdb::tools::nanoToOpenVDB(*nanoGrid);
+    float background = m_MaxDistance_From_Tsdf;
+
+    buffer_sdf_grid->tree().root().setBackground(background, false);
+    buffer_sdf_grid->setGridClass(openvdb::GRID_LEVEL_SET);
+
+    std::cout << "Background value before floodfill = " << buffer_sdf_grid->background() << std::endl;
+    std::cout << "TSDF Voxel Count before floodfill = " << buffer_sdf_grid->activeVoxelCount() << std::endl;
+    openvdb::tools::signedFloodFill(buffer_sdf_grid->tree());
+    std::cout << "Background value after floodfill = " << buffer_sdf_grid->background() << std::endl;
+    std::cout << "TSDF Voxel Count after floodfill = " << buffer_sdf_grid->activeVoxelCount() << std::endl;
+
+    applyfilters(buffer_sdf_grid);
+    return buffer_sdf_grid;
+}
+
+void PreProcess::applyfilters(openvdb::FloatGrid::Ptr grid)
+{
+    std::cout << "TSDF Voxel Count before filter = " << grid->activeVoxelCount() << std::endl;
+    grid->setGridClass(openvdb::GRID_LEVEL_SET);
+    openvdb::tools::LevelSetFilter<openvdb::FloatGrid> levelfilter(*grid);
+    // levelfilter.dilate(1);
+    levelfilter.gaussian(0.01f);
+    levelfilter.normalize();
+    levelfilter.track();
+    grid->tree().prune();
+    std::cout << "TSDF Voxel Count after filter = " << grid->activeVoxelCount() << std::endl;
+}
+
+openvdb::Vec3s PreProcess::compute_normal(openvdb::FloatGrid::Accessor sdf_accessor, openvdb::Coord point, bool debug)
+{
+    auto start = std::chrono::high_resolution_clock::now();
+
+    openvdb::Vec3s grad(0, 0, 0);
+    int neighbor_number = 0;
+    const float w[] = {3.0f, 10.0f, 3.0f}; // Poids de lissage
+    const int d[] = {-1, 0, 1};            // Poids de dérivation
+
+    for (int dz = -1; dz <= 1; ++dz)
+    {
+        for (int dy = -1; dy <= 1; ++dy)
+        {
+            for (int dx = -1; dx <= 1; ++dx)
+            {
+
+                openvdb::Coord neighbor(point.x() + dx, point.y() + dy, point.z() + dz);
+
+                if (!sdf_accessor.isValueOn(neighbor))
+                {
+                    continue;
+                }
+
+                float val = sdf_accessor.getValue(neighbor);
+
+                if (val > m_voxel_size)
+                {
+                    continue;
+                }
+                neighbor_number++;
+
+                grad.x() += (float)d[dx + 1] * w[dy + 1] * w[dz + 1] * val;
+                grad.y() += w[dx + 1] * (float)d[dy + 1] * w[dz + 1] * val;
+                grad.z() += w[dx + 1] * w[dy + 1] * (float)d[dz + 1] * val;
+            }
+        }
+    }
+    if (neighbor_number < MIN_NEIGHBOR)
+    {
+        return openvdb::Vec3s(0, 0, 0);
+    }
+
+    float lenSq = grad.x() * grad.x() + grad.y() * grad.y() + grad.z() * grad.z();
+
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> duration = end - start;
+    normal_timer += duration.count();
+
+    if (lenSq > 1e-8f)
+    {
+        float invLen = 1.0f / std::sqrt(lenSq);
+        return openvdb::Vec3s(grad.x() * invLen, grad.y() * invLen, grad.z() * invLen);
+    }
+    return openvdb::Vec3s(0, 0, 0);
+}
+
+void PreProcess::clear()
+{
+    input_weight_grid->clear();
+    input_normal_grid->clear();
+    ref_weight_grid->clear();
+    ref_normal_grid->clear();
+    buffer_sdf_grid->clear();
+    std::cout << "Every grid cleared" << std::endl;
+
+    normal_timer = 0;
+    tsdf_filter_timer = 0;
+
+    std::cout << "Timers reset" << std::endl;
+}

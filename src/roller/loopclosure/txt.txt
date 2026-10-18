@@ -1,0 +1,84 @@
+D'accord, passons à l'étape suivante. Puisque tu veux optimiser ton pipeline pour rejeter les faux candidats sans tout recalculer, voici comment structurer tes filtres par ordre de coût CPU croissant.
+
+L'idée est d'utiliser des "signatures" légères qui agissent comme des portiers.
+
+### 1. Filtre Géométrique (Priorité : Immédiate)
+Si ton SLAM te donne une position approximative (même avec une dérive), c'est ton premier rempart.
+* **Distance Euclidienne :** Si la distance entre la pose actuelle et la pose de la référence est supérieure à un seuil (ex: 15m), on ne tente même pas le calcul.
+* **Différence d'angle :** Si ton sonar a tourné de 180° par rapport à la référence, les zones d'ombre du relief ne correspondront plus.
+
+### 2. Filtre par Descripteur Global (Le "Check" Rapide)
+C'est le filtre le plus efficace. Au lieu de calculer des descripteurs FPFH sur chaque point (très coûteux), on calcule **un seul descripteur** pour tout le nuage.
+
+* **VFH (Viewpoint Feature Histogram) :** C'est un vecteur de 308 valeurs qui résume la géométrie du nuage et l'angle de vue.
+* **Fonctionnement :** Tu stockes le VFH de tes références. Quand un nouveau nuage arrive, tu calcules son VFH et tu fais une simple distance euclidienne avec tes références.
+* **Décision :** Si la distance est trop grande, les nuages sont trop différents géographiquement. **REJET.**
+
+
+
+### 3. Filtre de Cohérence des Correspondances (Pré-RANSAC)
+Si le descripteur global est passé, tu commences le pipeline local, mais tu peux l'arrêter après le matching FPFH :
+
+* **Nombre de paires :** Si après ton `Feature Matching`, tu as moins de 15 ou 20 correspondances, la probabilité d'un bon alignement est quasi nulle. **REJET.**
+* **Barycentre des paires :** Si toutes les lignes de correspondance (tes lignes vertes) partent vers un seul petit coin du nuage, la contrainte géométrique est trop faible pour verrouiller une rotation.
+
+### 4. Le "Check" de la Matrice de Transformation
+Une fois que `estimate_transform` a fini, avant de valider la Loop Closure :
+
+* **Vraisemblance physique :** Si la matrice indique un déplacement de 50m alors que ton robot se déplace à 1m/s et que le dernier scan date d'il y a 2s, c'est une erreur.
+* **Erreur de Recouvrement (Overlap) :** Tu transformes le nuage source avec la matrice trouvée et tu comptes combien de points tombent à moins de 5cm du nuage de référence. Si c'est moins de 50%, c'est un faux positif.
+
+---
+
+### Structure logicielle suggérée
+
+```cpp
+bool loop_closure::pre_filter(CloudPtr input, CloudPtr ref) {
+    // 1. Check Bounding Box (Dimensions globales)
+    if (!check_bbox_similarity(input, ref)) return false;
+
+    // 2. Check Global Descriptor (VFH)
+    float vfh_dist = compute_vfh_distance(input, ref);
+    if (vfh_dist > _vfh_threshold) return false;
+
+    return true; // On peut lancer la grosse pipeline
+}
+```
+
+
+
+### Recommandation pour ton Sonar
+Le sonar produit souvent des "fantômes" ou du bruit spéculaire. Le filtre par **VFH** est vraiment ce que je te recommande d'explorer. C'est une étape de 10ms qui peut t'éviter des calculs de 500ms sur des nuages qui n'ont aucune chance de matcher.
+
+Est-ce que tu veux que je te montre comment calculer un descripteur global rapide comme le **VFH** avec PCL ?
+
+
+
+
+
+
+
+
+Ray casting from nano : 
+/*
+        nanovdb::Coord point_on_tsdf;
+        float d_PointToTsdf;
+        float crossingPointValue;
+
+        // nanovdb::Vec3f
+        nanovdb::math::Ray<float> ray = getRay(sensor_pos_index, -dir_to_sensor, m_MaxDistance_From_Tsdf);
+
+        if (nanovdb::math::ZeroCrossing(ray, local_sdf_accessor, point_on_tsdf, crossingPointValue, d_PointToTsdf))
+        {}*/
+
+                    // nanovdb::Vec3f corrected_point = ray.start() + ray.dir() * d_PointToTsdf;
+
+nanovdb::math::Ray<float> PreProcess::getRay(const openvdb::Vec3f &sensor_pos, const openvdb::Vec3f &vector_to_sensor, float range_around_point)
+{
+    float search_window = range_around_point / m_voxel_size;
+    float distance_point_sensor = vector_to_sensor.length();
+    return nanovdb::math::Ray<float>(
+        nanovdb::Vec3f(sensor_pos.x(), sensor_pos.y(), sensor_pos.z()),
+        nanovdb::Vec3f(vector_to_sensor.x(), vector_to_sensor.y(), vector_to_sensor.z()),
+        distance_point_sensor - search_window, std::max(m_sonar_range / m_voxel_size, distance_point_sensor + search_window));
+}

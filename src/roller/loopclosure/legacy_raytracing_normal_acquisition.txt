@@ -1,0 +1,120 @@
+// Backup of Legacy Keyframe Ray-Tracing Normal Acquisition & Submap Flattening Implementation
+// Saved on 2026-07-29
+
+1. Legacy NormalAcquisition Kernel Invocation in loopclosure_cuda.cu:
+--------------------------------------------------------------------------------
+gpu_Submap flat_submap = this->flattenSubmap(submap, submap_keyframes);
+cudaMalloc(&gpu_Submap_Ptr, flat_submap.submap_bytes);
+cudaMemcpy(gpu_Submap_Ptr, flat_submap.submap.data(), flat_submap.submap_bytes, cudaMemcpyHostToDevice);
+cudaMalloc(&gpu_SubmapOffsets_Ptr, flat_submap.offset_table_bytes);
+cudaMemcpy(gpu_SubmapOffsets_Ptr, flat_submap.offset_table.data(), flat_submap.offset_table_bytes, cudaMemcpyHostToDevice);
+cudaMalloc(&gpu_SensorPos_Ptr, flat_submap.sensor_pos_bytes);
+cudaMemcpy(gpu_SensorPos_Ptr, flat_submap.sensor_pos.data(), flat_submap.sensor_pos_bytes, cudaMemcpyHostToDevice);
+
+cudaMalloc(&normalbuffer, flat_submap.num_points*sizeof(PointNormal_GPU));
+cudaMalloc(&normalCounter, sizeof(int));
+cudaMemset(normalCounter, 0, sizeof(int));
+
+NormalAcquisition(gpu_Submap_Ptr, normalbuffer, gpu_SDF_Ptr, Config::normal_calculation::distance_to_tsdf, gpu_SensorPos_Ptr, flat_submap.num_points, flat_submap.num_keyframe, _VoxelSize, normalCounter);
+cudaDeviceSynchronize();
+
+
+2. Legacy flattenSubmap Implementation:
+--------------------------------------------------------------------------------
+gpu_Submap CudaCore::flattenSubmap(const Submap& submap, const std::vector<Keyframe>& submap_keyframes){
+    gpu_Submap result;
+    size_t num_keyframe = submap_keyframes.size();
+    auto keyframe_vector = submap_keyframes;
+    
+    size_t num_points = 0;
+    std::vector<roller::PointCloudInt> correctedKeyframes;
+    
+    for(size_t i = 0; i < num_keyframe; i++){
+        const auto cloud = keyframe_vector[i].pointcloud;
+        if (!cloud) continue;
+        const auto correction = submap.correction;
+        PointCloudInt keyframe;
+        pcl::transformPointCloud(*cloud, keyframe, correction);
+        correctedKeyframes.push_back(keyframe);
+        num_points += cloud->size();
+    }
+    result.offset_table.reserve(num_keyframe + 1);
+    result.offset_table.push_back(0);
+    result.submap.reserve(num_points);
+    result.sensor_pos.reserve(num_keyframe);
+    
+    size_t offset = 0;
+    float4 tmp_point;
+    float3 tmp_sensor_xyz;
+    for (size_t index = 0; index < num_keyframe; index++){
+        for(const auto& point : correctedKeyframes[index].points){
+            tmp_point.x = point.x;
+            tmp_point.y = point.y;
+            tmp_point.z = point.z;
+            tmp_point.w = point.intensity;
+            result.submap.push_back(tmp_point);
+        }
+
+        const auto &pose = submap.correction * submap.keyframe_poses[index].fg;
+        Eigen::Vector3f sensor_pos_eigen = pose.block<3, 1>(0, 3);
+        tmp_sensor_xyz.x = sensor_pos_eigen.x(); tmp_sensor_xyz.y = sensor_pos_eigen.y(); tmp_sensor_xyz.z = sensor_pos_eigen.z();
+        result.sensor_pos.push_back(tmp_sensor_xyz);
+
+        offset += correctedKeyframes[index].size();
+        result.offset_table.push_back(offset);
+    }
+    result.submap_bytes = num_points * sizeof(float4);
+    result.offset_table_bytes = result.offset_table.size() * sizeof(int);
+    result.sensor_pos_bytes = result.sensor_pos.size() * sizeof(float3);
+
+    result.num_keyframe = num_keyframe;
+    result.num_points = num_points; 
+    return result;
+}
+
+
+3. Legacy normalCalcsKernel Implementation:
+--------------------------------------------------------------------------------
+__global__ void normalCalcsKernel(const float4* submap, const int* submap_offsets, int nb_of_keyframe, int num_points,
+    PointNormal_GPU* dest,
+    const nanovdb::NanoGrid<float>* sdf_grid,
+    const float3* sensor_xyz,
+    int* normalCounter,
+    float dist_to_sdf,
+    float voxelSize
+){
+    int point_global_index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (point_global_index >= num_points) return;
+
+    int KeyframeId = whichKeyframe(point_global_index, submap_offsets, nb_of_keyframe);
+    auto acc = sdf_grid->getAccessor(); 
+    
+    float3 point_xyz = make_float3(submap[point_global_index].x,submap[point_global_index].y,submap[point_global_index].z);
+
+    float3 sensor_pos = sensor_xyz[KeyframeId];
+    int3 sensor_xyz_index = to_index(sensor_pos,voxelSize);
+    int3 point_xyz_index = to_index(point_xyz,voxelSize);
+
+    int3 vct_point_to_sensor = make_int3(point_xyz_index.x - sensor_xyz_index.x, point_xyz_index.y - sensor_xyz_index.y, point_xyz_index.z - sensor_xyz_index.z);
+    float3 dir_point_to_sensor = normalize(vct_point_to_sensor);
+    float d_PointToSensor = len<false>(vct_point_to_sensor);
+
+    nanovdb::math::Ray<float> ray = getRay(sensor_xyz_index, dir_point_to_sensor, d_PointToSensor, voxelSize, dist_to_sdf);
+    nanovdb::Coord point_on_tsdf; float d_SensorToTsdf; float crossingPointValue;
+
+    if(nanovdb::math::zeroCrossing(ray, acc, point_on_tsdf, crossingPointValue, d_SensorToTsdf)){
+        bool is_valid = false;
+        float3 computed_normal = computeNormal(acc, point_on_tsdf, voxelSize, is_valid);
+
+        if(is_valid){
+            float d_PointToTsdf = fabsf(d_SensorToTsdf - d_PointToSensor);
+            PointNormal_GPU result;
+            result.normal = computed_normal;
+            result.pos = make_float3(point_on_tsdf.x()* voxelSize, point_on_tsdf.y()* voxelSize, point_on_tsdf.z()* voxelSize);
+            result.normal_trust = fmaxf(0.0f, 0.1f - d_PointToTsdf*voxelSize)/0.1f;
+            
+            int table_index = atomicAdd(normalCounter, 1);
+            dest[table_index] = result;
+        }
+    }
+}

@@ -1,0 +1,58 @@
+#pragma once
+
+#include <rclcpp/rclcpp.hpp>
+
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+#include <pcl/common/distances.h>
+#include <pcl/common/transforms.h>
+#include <pcl/search/kdtree.h>
+#include <pcl/kdtree/kdtree.h>
+#include <pcl/filters/voxel_grid.h>
+
+#include <nanovdb/NanoVDB.h>
+#include <nanovdb/GridHandle.h>
+#include <nanovdb/util/Ray.h>
+#include <nanovdb/math/HDDA.h>
+
+#include <vector>
+#include <chrono>
+
+#include <roller/tsdf/tsdf_data.hpp>
+#include <roller/submap.hpp>
+
+
+namespace roller{
+    class semantic_segmentation{
+        public:
+            semantic_segmentation(rclcpp::Node *_node, std::mutex *_db_mutex);
+
+
+            void save(const std::string &directory, std::string filename, bool NoProcessJustSave);
+            void clear();
+            void start(std::vector<Submap> map, const TsdfData &tsdf, const std::string &directory, bool NoProcessJustSave);
+
+
+        private:        
+            pcl::PointCloud<pcl::PointXYZ>::Ptr m_pointcloud;
+            pcl::search::KdTree<pcl::PointXYZ>::Ptr m_searchtree;
+            
+            pcl::PointCloud<pcl::PointXYZL>::Ptr labeled_cloud;
+
+            std::vector<pcl::PointXYZ> final_modes;
+            std::vector<pcl::PointXYZ> unique_modes;
+            
+            
+            //Parameters
+            double bandwidth, epsilon, voxel_size, sonar_range, truncation, cluster_threshold, leaf_size;
+            int max_iter;
+
+            nanovdb::math::Ray<float> getRay(const Eigen::Vector3i &sensor_pos, const Eigen::Vector3f &vector_to_sensor, float range_around_point);
+
+            void generate_pointcloud(std::vector<Submap> map, const TsdfData &tsdf, bool NoProcessJustSave);
+            void voxelize_pointcloud();
+            void mean_shift();
+            
+            void attribute_labels();
+    };
+}

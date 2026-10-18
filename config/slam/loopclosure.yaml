@@ -1,0 +1,83 @@
+sonar3d_node:
+  ros__parameters:
+    normal_calculation:
+      gaussian_filter: true
+      gaussian_width: 2
+      gaussian_repetitions: 3
+      distance_to_tsdf: 0.3 # for the raytracing noise filter
+    estimate_keypoints:
+      method: "harris3d_cuda" # Options: "harris3d" (CPU PCL), "iss" (CPU PCL), "harris3d_cuda" (GPU CUDA), "iss3d_cuda" (GPU CUDA), or "voxelisation"
+      
+      # Note: filtering_method, scale_aware, and nms parameters below are used ONLY for GPU CUDA implementations ("harris3d_cuda", "iss3d_cuda"):
+      filtering_method: "nms" # "thresholding" or "top_k" or "nms" (GPU CUDA only)
+      keypoint_sampler_size: 0.0 # multiple of submap voxel_size for keypoint downsampling (set to 0 to disable)
+      scale_aware:
+        enabled: false # calculate scores across multiple search radii/scales (GPU CUDA only)
+        num_scales: 3 # number of scale steps (GPU CUDA only)
+        scale_multiplier: 1.5 # multiplier per scale step (GPU CUDA only)
+      nms:
+        radius: 0.5 # base radius in meters for 3D Non-Maximum Suppression (GPU CUDA only)
+      fixed_nb_of_kp: false
+      nb_of_selected: 50000
+
+      # PCL CPU Keypoint Extractors
+      harris3d:
+        radius: 0.2                       # search radius for PCL CPU Harris3D
+        score_threshold: 0.0              # score threshold for PCL CPU Harris3D
+      iss:
+        searchRadius: 0.2                 # salient radius for PCL CPU ISS3D
+        gamma_21: 0.8                     # used to reject tubular structures
+        gamma_32: 0.5                     # used to reject flat structures
+        min_neighbors: 5                  # minimum neighbors for PCL CPU ISS3D
+
+      # GPU CUDA Keypoint Extractors
+      harris3d_cuda:
+        score_threshold: -0.0325          # score threshold for GPU CUDA Harris3D
+        k: 0.04                           # Harris response parameter k
+      iss3d_cuda:
+        searchRadius: 0.2                 # search radius in meters for GPU CUDA ISS3D
+        gamma_21: 0.8                     # used to reject tubular structures for GPU CUDA ISS3D
+        gamma_32: 0.5                     # used to reject flat structures for GPU CUDA ISS3D
+        score_threshold: 0.002            # score threshold for GPU CUDA ISS3D
+
+      voxelisation:
+        voxel_size: 0.1 # in meters
+    extract_feature_descriptors:
+      method: "fpfh" # "fpfh", "shot", or "hpnvd"
+      fpfh:
+        use_k_instead_of_radius: false
+        fpfh_radius: 1.5
+        fpfh_k: 20
+      shot:
+        shot_radius: 1.5
+      hpnvd:
+        hpnvd_radius: 1.5
+        hpnvd_bin_num: 36
+    match_features:
+      method: "base_pcl"                        # "base_pcl", "Lowe_Ratio" or "Sinkhorn"
+      lowe_ratio: 0.8
+      reciprocal: true
+      Sinkhorn:
+        epsilon: 0.05
+        dustbin_score: -0.7
+        max_iterations: 20
+    match_rejection:
+      inlier_threshold: 0.2
+      max_iteration: 5000
+    transformation_estimation:
+      method: "teaser"  # "umeyama" or "teaser", with teaser match rejection parameters become irrelevant
+      teaser:
+        estimate_scaling: false
+        noise_bound_multiplier: 5.0  # multiplied by voxel_size
+        rotation_estimation_algorithm: "GNC_TLS"  # "GNC_TLS" or "FGR" or "QUATRO"
+        rotation_gnc_factor: 1.4
+        rotation_max_iterations: 100
+        rotation_cost_threshold: 1.0e-6
+        inlier_selection_mode: "PMC_EXACT"  # "PMC_EXACT", "PMC_HEU", "KCORE_HEU", or "NONE"
+        inlier_graph_formulation: "COMPLETE"   # "CHAIN" or "COMPLETE"
+        max_clique_time_limit: 0.5       # Maximum time allocated to the clique solver (in seconds)  
+    debug:
+      # Note: Enabling allow_pointcloud_extraction will copy full surface pointclouds from GPU and impact pipeline performance.
+      allow_pointcloud_extraction: true
+      
+

@@ -1,0 +1,13 @@
+hpp :
+    #include <roller/loopclosure/host_pipeline.hpp>
+    
+    std::unique_ptr<roller::loopclosure::loopclosure_master> gblc;
+
+cpp :
+    
+    
+    //global loopclosure call--------------------------
+    std::cout << "--- LOOP CLOSURE ---" << std::endl;
+    gblc->on_new_submap(new_submap, n_created_submap_tmp+1, 
+                current_submap_keyframes, *new_submap.tsdf.sdf);
+    //-------------------------------------------------

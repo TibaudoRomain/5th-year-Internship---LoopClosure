@@ -1,0 +1,69 @@
+# ==============================================================================
+# Ignore all files by default
+# (Excludes proprietary lab files not written by the author)
+# ==============================================================================
+/*
+
+# ------------------------------------------------------------------------------
+# Whitelist project documentation & git configuration
+# ------------------------------------------------------------------------------
+!/.gitignore
+!/README.md
+
+# ------------------------------------------------------------------------------
+# Whitelist Loop Closure configuration
+# ------------------------------------------------------------------------------
+!/config/
+/config/*
+!/config/slam/
+/config/slam/*
+!/config/slam/loopclosure.yaml
+
+# ------------------------------------------------------------------------------
+# Whitelist Loop Closure headers & CUDA definitions
+# ------------------------------------------------------------------------------
+!/include/
+/include/*
+!/include/roller/
+/include/roller/*
+
+# Detail templates
+!/include/roller/detail/
+/include/roller/detail/*
+!/include/roller/detail/host_pipeline_impl.hpp
+
+# Loop closure module headers
+!/include/roller/loopclosure/
+!/include/roller/loopclosure/**
+
+# ------------------------------------------------------------------------------
+# Whitelist Loop Closure source files & CUDA kernels
+# ------------------------------------------------------------------------------
+!/src/
+/src/*
+!/src/roller/
+/src/roller/*
+!/src/roller/loopclosure/
+!/src/roller/loopclosure/**
+
+# ------------------------------------------------------------------------------
+# Build artifacts, logs, binaries and temporary files
+# ------------------------------------------------------------------------------
+build/
+install/
+log/
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+*.pyc
+__pycache__/
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/

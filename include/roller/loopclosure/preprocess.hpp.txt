@@ -1,0 +1,82 @@
+#pragma once
+
+#include <rclcpp/rclcpp.hpp>
+
+#include <openvdb/Types.h>
+#include <openvdb/tools/SignedFloodFill.h>
+#include <openvdb/tools/LevelSetFilter.h>
+#include <openvdb/tools/RayIntersector.h>
+#include <openvdb/tools/Filter.h>
+#include <openvdb/tools/Clip.h>
+#include <openvdb/tree/RootNode.h>
+
+#define NANOVDB_USE_OPENVDB
+#include <nanovdb/tools/CreateNanoGrid.h>
+#include <nanovdb/NanoVDB.h>
+#include <nanovdb/GridHandle.h>
+#include <nanovdb/tools/NanoToOpenVDB.h>
+#include <nanovdb/util/Ray.h>
+#include <nanovdb/util/SampleFromVoxels.h>
+
+#include <nanovdb/math/HDDA.h>
+
+
+#include <pcl/io/pcd_io.h>
+#include <pcl/common/transforms.h>
+
+#include <vector>
+#include <execution>
+#include <chrono>
+
+#include <roller/tsdf/tsdf_data.hpp>
+#include <roller/submap.hpp>
+#include <roller/loopclosure/pcl_toolbox.hpp>
+
+
+namespace roller::loopclosure{
+    class PreProcess{
+        public:
+            PreProcess(rclcpp::Node *_node, std::mutex *_db_mutex);
+            ~PreProcess();
+            void set_reference(PointCloudInt ref, Matrix4 correction, Matrix4 fg, const TsdfData &tsdf);
+            void new_input(PointCloudInt input, Matrix4 correction, Matrix4 fg, const TsdfData &tsdf);
+            void clear();
+        
+        private:
+            std::mutex *m_db_mutex;
+            
+            rclcpp::Node *m_node;
+
+            float m_voxel_size, m_MaxDistance_From_Tsdf, m_sonar_range;
+
+            //timers
+            double normal_timer, tsdf_filter_timer;
+
+            bool is_reference_set = false;
+            Eigen::Matrix4f reference_pose;
+
+            openvdb::FloatGrid::Ptr input_weight_grid = openvdb::FloatGrid::create();
+            openvdb::Vec3SGrid::Ptr input_normal_grid = openvdb::Vec3SGrid::create();
+            
+            openvdb::FloatGrid::Ptr ref_weight_grid = openvdb::FloatGrid::create();
+            openvdb::Vec3SGrid::Ptr ref_normal_grid = openvdb::Vec3SGrid::create();
+
+            //openvdb::Vec3SGrid::Accessor input_normal_accessor, ref_normal_accessor;
+            //openvdb::FloatGrid::Accessor input_weight_accessor, ref_weight_accessor;
+
+            openvdb::FloatGrid::Ptr buffer_sdf_grid = openvdb::FloatGrid::create();
+            nanovdb::GridHandle<nanovdb::HostBuffer> m_buffer_handle;
+
+
+            
+            void process_keyframe(PointCloudInt keyframe, Eigen::Vector3f sensor_pos, const TsdfData &tsdf, bool is_ref);
+                        
+            openvdb::Vec3s compute_normal(openvdb::FloatGrid::Accessor sdf_accessor, openvdb::Coord point, bool debug);
+            
+            openvdb::FloatGrid::Ptr nano_signedFloodFillWithValues(nanovdb::FloatGrid* nanoGrid);
+            
+            openvdb::math::Ray<double> getRay(const openvdb::Vec3f &ray_start, const openvdb::Vec3f &ray_direction, float range_around_point);
+
+            void applyfilters(openvdb::FloatGrid::Ptr grid);
+    };
+}
